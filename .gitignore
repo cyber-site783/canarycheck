@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test binaries built locally (only the C source is kept in the repo)
+examples/secure
+examples/no-canary
+examples/no-pie
+examples/partial-relro
+examples/no-relro
+examples/nx-off
+examples/no-fortify
+examples/secure32
+
+# Generated reports (the sample report is kept in the repo)
+reports/
+*.log

@@ -1,0 +1,12 @@
+CanaryCheck report: secure
+Class: ELF64, little-endian, Type: ET_DYN (shared object / PIE)
+
+Mitigation           Verdict   Evidence
+------------------------------------------------------------------------------
+NX                   PRESENT   PT_GNU_STACK present, not executable (RW)
+PIE                  PRESENT   ET_DYN (position-independent executable)
+Stack Canary         PRESENT   symbol __stack_chk_fail found
+RELRO                PRESENT   PT_GNU_RELRO + bind-now (full RELRO)
+Fortified Functions  PRESENT   3 fortified function(s): __memcpy_chk, __stpcpy_chk, __strcpy_chk
+------------------------------------------------------------------------------
+Result: ALL MITIGATIONS PRESENT
