@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """CanaryCheck - Your Own Binary Exploit-Mitigation Checker.
 
-Reads an ELF binary's own headers (no external parser, struct only)
+Reads a binary's own headers (no external parser, struct only)
 and reports which exploit mitigations are switched on:
 
-    NX, PIE, stack canary, RELRO (full / partial) and fortified functions.
+    ELF: NX, PIE, stack canary, RELRO (full / partial) and fortified
+         functions.
+    PE:  NX, ASLR, Control Flow Guard (CFG) and SafeSEH.
 
 Usage:
     python3 canarycheck.py <binary> [-o report.txt] [--json]
@@ -12,7 +14,7 @@ Usage:
 Exit codes:
     0 - every applicable mitigation is present
     1 - at least one mitigation is missing or partial
-    2 - usage error or the file is not a readable ELF binary
+    2 - usage error or the file is not a readable ELF or PE binary
 """
 
 import argparse
@@ -58,6 +60,26 @@ ET_NAMES = {ET_REL: "ET_REL (relocatable)",
             ET_EXEC: "ET_EXEC (executable)",
             ET_DYN: "ET_DYN (shared object / PIE)"}
 
+# --- PE constants ----------------------------------------------------------
+
+PE_MAGIC = b"MZ"
+PE_SIGNATURE = b"PE\x00\x00"
+
+IMAGE_FILE_MACHINE_I386 = 0x014C
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+
+IMAGE_FILE_DLL = 0x2000
+
+# DllCharacteristics flags (optional header, offset 70, both PE32/PE32+).
+IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA = 0x0020
+IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x0040
+IMAGE_DLLCHARACTERISTICS_NX_COMPAT = 0x0100
+IMAGE_DLLCHARACTERISTICS_NO_SEH = 0x0400
+IMAGE_DLLCHARACTERISTICS_GUARD_CF = 0x4000
+
+PE_MACHINE_NAMES = {IMAGE_FILE_MACHINE_I386: "i386",
+                    IMAGE_FILE_MACHINE_AMD64: "x86-64"}
+
 # Verdict values used in the table and the JSON report.
 PRESENT = "PRESENT"
 PARTIAL = "PARTIAL"
@@ -67,6 +89,14 @@ NOT_APPLICABLE = "N/A"
 
 class NotElfError(Exception):
     """Raised when the file is not a readable ELF binary."""
+
+
+class NotPeError(Exception):
+    """Raised when the file is not a readable PE binary."""
+
+
+class NotBinaryError(Exception):
+    """Raised when the file is neither an ELF nor a PE binary."""
 
 
 # --- ELF parsing ---------------------------------------------------------
@@ -229,6 +259,75 @@ class ElfFile:
         return names
 
 
+# --- PE parsing ------------------------------------------------------------
+
+class PeFile:
+    """Minimal PE reader: DOS header, PE signature, COFF header and the
+    DllCharacteristics field of the optional header. Standard library
+    only. PE files are always little-endian."""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            self.data = f.read()
+        self._parse_dos_header()
+        self._parse_coff_header()
+        self._parse_optional_header()
+
+    def _parse_dos_header(self):
+        """Read e_lfanew (offset of the PE signature) from the DOS header."""
+        if self.data[:2] != PE_MAGIC:
+            raise NotPeError("not a PE file (bad MZ magic bytes)")
+        if len(self.data) < 64:
+            raise NotPeError("truncated PE file (DOS header incomplete)")
+        self.e_lfanew = struct.unpack_from("<I", self.data, 0x3C)[0]
+        if self.e_lfanew + 6 > len(self.data):
+            raise NotPeError("truncated PE file (e_lfanew past end of file)")
+        if self.data[self.e_lfanew:self.e_lfanew + 4] != PE_SIGNATURE:
+            raise NotPeError("bad PE signature at e_lfanew")
+
+    def _parse_coff_header(self):
+        """Read the 20-byte COFF header after the PE signature."""
+        off = self.e_lfanew + 4
+        size = struct.calcsize("<HHIIIHH")
+        if off + size > len(self.data):
+            raise NotPeError("truncated COFF header")
+        (self.machine, self.num_sections, self.timestamp,
+         self.ptr_symtab, self.num_symbols, self.opt_header_size,
+         self.characteristics) = struct.unpack_from("<HHIIIHH",
+                                                    self.data, off)
+        self.machine_name = PE_MACHINE_NAMES.get(
+            self.machine, "machine 0x%04x" % self.machine)
+        self.is_dll = bool(self.characteristics & IMAGE_FILE_DLL)
+
+    def _parse_optional_header(self):
+        """Read the optional-header magic and DllCharacteristics."""
+        off = self.e_lfanew + 24
+        if self.opt_header_size == 0:
+            raise NotPeError("no optional header (not a PE image)")
+        if off + 2 > len(self.data):
+            raise NotPeError("truncated optional header")
+        magic = struct.unpack_from("<H", self.data, off)[0]
+        if magic == 0x10B:
+            self.is_64bit = False
+            self.format_name = "PE32"
+        elif magic == 0x20B:
+            self.is_64bit = True
+            self.format_name = "PE32+"
+        else:
+            raise NotPeError("unknown optional-header magic: 0x%04x" % magic)
+        # DllCharacteristics is a uint16 at optional-header offset 70
+        # in both PE32 and PE32+.
+        dc_off = off + 70
+        if dc_off + 2 > len(self.data):
+            raise NotPeError("truncated optional header "
+                             "(no DllCharacteristics)")
+        self.dll_characteristics = struct.unpack_from("<H", self.data,
+                                                      dc_off)[0]
+        kind = "DLL" if self.is_dll else "executable"
+        self.type_name = "%s %s, %s" % (self.format_name, kind,
+                                        self.machine_name)
+
+
 # --- Mitigation verdicts ---------------------------------------------------
 
 def check_nx(elf):
@@ -278,7 +377,57 @@ def check_fortify(symbols):
     return (MISSING, "no fortified (_chk) symbols found"), []
 
 
-def analyse(path):
+# --- PE mitigation verdicts --------------------------------------------------
+
+def check_pe_nx(pe):
+    """NX is on when the NX_COMPAT flag is set in DllCharacteristics."""
+    if pe.dll_characteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT:
+        return (PRESENT, "NX_COMPAT set (DllCharacteristics 0x%04x)"
+                % pe.dll_characteristics)
+    return (MISSING, "NX_COMPAT not set (DllCharacteristics 0x%04x)"
+            % pe.dll_characteristics)
+
+
+def check_pe_aslr(pe):
+    """ASLR is on when the DYNAMIC_BASE flag is set in DllCharacteristics."""
+    dc = pe.dll_characteristics
+    if dc & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE:
+        if pe.is_64bit and dc & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA:
+            return (PRESENT, "DYNAMIC_BASE + HIGH_ENTROPY_VA set "
+                    "(64-bit ASLR, DllCharacteristics 0x%04x)" % dc)
+        return (PRESENT, "DYNAMIC_BASE set (ASLR on, "
+                "DllCharacteristics 0x%04x)" % dc)
+    return (MISSING, "DYNAMIC_BASE not set (fixed load address, "
+            "DllCharacteristics 0x%04x)" % dc)
+
+
+def check_pe_cfg(pe):
+    """Control Flow Guard is on when the GUARD_CF flag is set."""
+    if pe.dll_characteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF:
+        return (PRESENT, "GUARD_CF set (Control Flow Guard on, "
+                "DllCharacteristics 0x%04x)" % pe.dll_characteristics)
+    return (MISSING, "GUARD_CF not set (Control Flow Guard off, "
+            "DllCharacteristics 0x%04x)" % pe.dll_characteristics)
+
+
+def check_pe_safeseh(pe):
+    """SafeSEH only applies to 32-bit x86: it is on when the NO_SEH flag
+    is not set. On 64-bit, SEH is table-based, so the check is N/A."""
+    if pe.machine == IMAGE_FILE_MACHINE_AMD64:
+        return (NOT_APPLICABLE,
+                "64-bit PE: SEH is table-based, SafeSEH does not apply")
+    if pe.machine != IMAGE_FILE_MACHINE_I386:
+        return (NOT_APPLICABLE,
+                "SafeSEH only applies to 32-bit x86 (%s)"
+                % pe.machine_name)
+    if pe.dll_characteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH:
+        return (MISSING, "NO_SEH set (SafeSEH off, "
+                "DllCharacteristics 0x%04x)" % pe.dll_characteristics)
+    return (PRESENT, "NO_SEH not set (SafeSEH on, "
+            "DllCharacteristics 0x%04x)" % pe.dll_characteristics)
+
+
+def analyse_elf(path):
     """Parse one binary and return the full result dict."""
     elf = ElfFile(path)
     symbols = elf.symbol_names()
@@ -312,6 +461,47 @@ def analyse(path):
         "fortified_functions": fortified,
         "all_present": not failed,
     }
+
+
+def analyse_pe(path):
+    """Parse one PE binary and return the full result dict."""
+    pe = PeFile(path)
+
+    nx_verdict, nx_evidence = check_pe_nx(pe)
+    aslr_verdict, aslr_evidence = check_pe_aslr(pe)
+    cfg_verdict, cfg_evidence = check_pe_cfg(pe)
+    seh_verdict, seh_evidence = check_pe_safeseh(pe)
+
+    checks = [
+        {"name": "NX", "verdict": nx_verdict, "evidence": nx_evidence},
+        {"name": "ASLR", "verdict": aslr_verdict, "evidence": aslr_evidence},
+        {"name": "CFG", "verdict": cfg_verdict, "evidence": cfg_evidence},
+        {"name": "SafeSEH", "verdict": seh_verdict, "evidence": seh_evidence},
+    ]
+    # N/A (e.g. SafeSEH on 64-bit) does not count as a failure.
+    failed = [c for c in checks
+              if c["verdict"] in (MISSING, PARTIAL)]
+    return {
+        "file": os.path.basename(path),
+        "path": path,
+        "class": pe.format_name,
+        "endianness": "little-endian",
+        "type": pe.type_name,
+        "checks": checks,
+        "fortified_functions": [],
+        "all_present": not failed,
+    }
+
+
+def analyse(path):
+    """Detect the file type by magic bytes and parse it (ELF or PE)."""
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic == ELF_MAGIC:
+        return analyse_elf(path)
+    if magic[:2] == PE_MAGIC:
+        return analyse_pe(path)
+    raise NotBinaryError("not an ELF or PE binary (unknown file type)")
 
 
 # --- Reporting -------------------------------------------------------------
@@ -348,8 +538,10 @@ def render_json(result):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="CanaryCheck - check NX, PIE, stack canary, RELRO and "
-                    "fortified functions in an ELF binary.")
-    parser.add_argument("binary", help="path to the ELF binary to check")
+                    "fortified functions in an ELF binary, or NX, ASLR, CFG "
+                    "and SafeSEH in a PE binary.")
+    parser.add_argument("binary",
+                        help="path to the ELF or PE binary to check")
     parser.add_argument("-o", "--output", metavar="FILE",
                         help="save the report to FILE as well")
     parser.add_argument("--json", action="store_true",
@@ -364,6 +556,13 @@ def main(argv=None):
     except NotElfError as exc:
         print("error: %s is not an ELF binary: %s" % (args.binary, exc),
               file=sys.stderr)
+        return 2
+    except NotPeError as exc:
+        print("error: %s is not a PE binary: %s" % (args.binary, exc),
+              file=sys.stderr)
+        return 2
+    except NotBinaryError as exc:
+        print("error: %s: %s" % (args.binary, exc), file=sys.stderr)
         return 2
     except (OSError, struct.error) as exc:
         print("error: could not read %s: %s" % (args.binary, exc),
